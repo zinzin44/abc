@@ -1,0 +1,34 @@
+name: RDP
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - run: curl -L --output cf.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
+      - shell: pwsh
+        run: |
+          $pass = "${{ secrets.RDP_PASSWORD }}"
+          net user User $pass /add
+          net localgroup administrators User /add
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Start-Service TermService
+      - shell: pwsh
+        run: Start-Process -FilePath ".\cf.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -NoNewWindow -RedirectStandardError err.txt
+      - shell: pwsh
+        run: |
+          Start-Sleep -Seconds 15
+          $content = Get-Content err.txt -Raw
+          $url = [regex]::Match($content, 'https://[a-z0-9-]+\.trycloudflare\.com').Value
+          "URL: $url" | Out-File info.txt
+          "User: User" | Out-File info.txt -Append
+          "Pass: ${{ secrets.RDP_PASSWORD }}" | Out-File info.txt -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: info
+          path: info.txt
+        if: always()
+      - run: ping -n 21600 127.0.0.1 > nul
+      - shell: pwsh
+        if: always()
+        run: net user User /delete
