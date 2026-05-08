@@ -37,66 +37,58 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
-          Write-Host "RDP enabled, waiting for port..."
+          Write-Host "RDP Enabled"
 
       - name: Wait for RDP Port
         shell: pwsh
         run: |
           for ($i=0; $i -lt 30; $i++) {
             Start-Sleep -Seconds 2
-            $portOpen = Test-NetConnection localhost -Port 3389 -InformationLevel Quiet
-            if ($portOpen) {
-              Write-Host "Port 3389 is open."
+            if (Test-NetConnection localhost -Port 3389 -InformationLevel Quiet) {
+              Write-Host "Port 3389 is open"
               exit 0
             }
           }
-          Write-Error "Port 3389 did not become open."
+          Write-Error "Port 3389 not open"
 
-      - name: Start Tunnel with Retry
+      - name: Start Tunnel and Get URL (Fixed)
         shell: pwsh
         run: |
-          $logFile = "tunnel.log"
+          $stderrLog = "stderr.log"
           $urlFile = "tunnel_url.txt"
-          Remove-Item -Force $logFile, $urlFile -ErrorAction SilentlyContinue
+          Remove-Item -Force $stderrLog, $urlFile -ErrorAction SilentlyContinue
 
-          $maxRetries = 3
-          for ($try=1; $try -le $maxRetries; $try++) {
-            Write-Host "Starting tunnel attempt $try..."
-            $proc = Start-Process -FilePath ".\cloudflared.exe" `
-              -ArgumentList "tunnel --protocol http2 --url rdp://localhost:3389" `
-              -WindowStyle Hidden -PassThru `
-              -RedirectStandardOutput $logFile -RedirectStandardError $logFile
+          # تشغيل العملية وتوجيه stderr فقط إلى ملف (stdout نهمله)
+          $proc = Start-Process -FilePath ".\cloudflared.exe" `
+            -ArgumentList "tunnel --protocol http2 --url tcp://localhost:3389" `
+            -WindowStyle Hidden -PassThru `
+            -RedirectStandardError $stderrLog
 
-            # ابحث عن الرابط لمدة 60 ثانية
-            $url = $null
-            for ($i=0; $i -lt 60; $i++) {
-              Start-Sleep -Seconds 1
-              if (Test-Path $logFile) {
-                $content = Get-Content $logFile -Raw
-                if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
-                  $url = $matches[1]
-                  break
-                }
+          $found = $false
+          $timeout = 90
+          for ($i=0; $i -lt $timeout; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-Path $stderrLog) {
+              $content = Get-Content $stderrLog -Raw -ErrorAction SilentlyContinue
+              if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+                $url = $matches[1]
+                $found = $true
+                break
               }
             }
-            if ($url) {
-              Write-Host "::add-mask::$url"
-              $url | Out-File -FilePath $urlFile
-              $proc.Id | Out-File -FilePath tunnel.pid
-              Write-Host "Tunnel started successfully."
-              break
-            } else {
-              Write-Host "Attempt $try failed to get URL. Killing process."
-              $proc.Kill()
-              Start-Sleep -Seconds 5
-            }
           }
 
-          if (-not (Test-Path $urlFile)) {
-            Write-Host "All attempts failed. Log content:"
-            Get-Content $logFile
+          if (-not $found) {
+            Write-Host "ERROR: No tunnel URL found"
+            Write-Host "--- stderr content ---"
+            Get-Content $stderrLog -ErrorAction SilentlyContinue
             exit 1
           }
+
+          Write-Host "::add-mask::$url"
+          $url | Out-File -FilePath $urlFile -Encoding ascii
+          $proc.Id | Out-File -FilePath tunnel.pid
+          Write-Host "Tunnel started successfully"
 
       - name: Send Instructions to Telegram
         shell: pwsh
@@ -121,7 +113,7 @@ jobs:
           $api = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
           $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$msg"
           Invoke-RestMethod -Uri $api -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" | Out-Null
-          Write-Host "Sent to Telegram"
+          Write-Host "Message sent to Telegram"
 
       - name: Keep Alive
         shell: pwsh
@@ -142,4 +134,4 @@ jobs:
           Get-Process -Name cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
           $user = "${{ secrets.RDP_USERNAME }}"
           if ($user) { net user $user /delete 2>$null }
-          Write-Host "Cleanup done."
+          Write-Host "Cleanup done"
