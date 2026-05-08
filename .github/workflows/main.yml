@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'مدة التشغيل بالدقائق (الحد الأقصى 360 دقيقة)'
+        description: 'مدة التشغيل بالدقائق (الحد الأقصى 360)'
         required: false
         default: '360'
 
@@ -17,31 +17,60 @@ jobs:
         run: |
           curl -L --output cloudflared.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
 
-      - name: 2. تكوين RDP
+      - name: 2. التحقق من الأسرار
         shell: pwsh
         run: |
-          $securePassword = "${{ secrets.RDP_PASSWORD }}"
+          $errors = @()
+          if ("${{ secrets.RDP_USERNAME }}" -eq "") {
+            $errors += "❌ RDP_USERNAME غير معرف في secrets"
+          }
+          if ("${{ secrets.RDP_PASSWORD }}" -eq "") {
+            $errors += "❌ RDP_PASSWORD غير معرف في secrets"
+          }
+          if ("${{ secrets.TELEGRAM_BOT_TOKEN }}" -eq "") {
+            $errors += "❌ TELEGRAM_BOT_TOKEN غير معرف في secrets"
+          }
+          if ("${{ secrets.TELEGRAM_CHAT_ID }}" -eq "") {
+            $errors += "❌ TELEGRAM_CHAT_ID غير معرف في secrets"
+          }
+          if ($errors.Count -gt 0) {
+            Write-Error ($errors -join "`n")
+            exit 1
+          }
+          Write-Host "✅ جميع الأسرار موجودة"
+
+      - name: 3. تكوين RDP وإنشاء المستخدم
+        shell: pwsh
+        run: |
           $username = "${{ secrets.RDP_USERNAME }}"
+          $password = "${{ secrets.RDP_PASSWORD }}"
           
-          # إخفاء كلمة السر واسم المستخدم من السجلات
-          Write-Host "::add-mask::$securePassword"
-          Write-Host "::add-mask::$username"
+          # إخفاء القيم الحساسة من السجل فقط إن لم تكن فارغة
+          if ($username) { Write-Host "::add-mask::$username" }
+          if ($password) { Write-Host "::add-mask::$password" }
           
-          # إنشاء المستخدم وإعداد RDP
-          net user $username $securePassword /add
+          # إنشاء المستخدم
+          net user $username $password /add
+          if ($LASTEXITCODE -ne 0) { throw "فشل إنشاء المستخدم" }
+          
           net localgroup administrators $username /add
+          if ($LASTEXITCODE -ne 0) { throw "فشل إضافة المستخدم إلى المجموعة" }
+          
+          # تمكين RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Start-Service TermService
+          
+          Write-Host "✅ تم إعداد RDP والمستخدم $username"
 
-      - name: 3. إنشاء نفق Cloudflare
+      - name: 4. تشغيل نفق Cloudflare والحصول على الرابط
         shell: pwsh
         run: |
-          # تشغيل النفق في الخلفية وتسجيل المخرجات
           Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -NoNewWindow -RedirectStandardOutput "out.txt" -RedirectStandardError "err.txt"
-
-          # انتظار الحصول على رابط النفق
+          
+          # انتظار الرابط
+          $tunnelUrl = $null
           for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Seconds 2
             $content = Get-Content "err.txt" -ErrorAction SilentlyContinue
@@ -50,53 +79,65 @@ jobs:
               break
             }
           }
+          
+          if (-not $tunnelUrl) {
+            Write-Error "لم يتم الحصول على رابط النفق"
+            exit 1
+          }
+          
           # حفظ الرابط في ملف
           $tunnelUrl | Out-File -FilePath "tunnel_url.txt" -Encoding ascii
+          Write-Host "✅ تم الحصول على الرابط: $tunnelUrl"
 
-      - name: 4. إرسال معلومات الاتصال إلى تليجرام
+      - name: 5. إرسال المعلومات إلى تليجرام
         shell: pwsh
         run: |
           $tunnelUrl = Get-Content "tunnel_url.txt" -Raw
           $username = "${{ secrets.RDP_USERNAME }}"
           $password = "${{ secrets.RDP_PASSWORD }}"
+          $duration = "${{ github.event.inputs.duration_minutes }}"
           
-          # تجميع الرسالة
           $message = @"
-          ✅ تم تشغيل RDP بنجاح!
+✅ تم تشغيل RDP بنجاح!
+
+🔗 رابط الاتصال: $tunnelUrl
+👤 اسم المستخدم: $username
+🔑 كلمة المرور: $password
+⏱️ المدة المتبقية: $duration دقيقة (الحد الأقصى 360)
+💻 نظام التشغيل: Windows Server Core
+
+⚠️ الرابط وكلمة المرور حساسان – لا تشاركهما.
+"@
           
-          🔗 رابط الاتصال: $tunnelUrl
-          👤 اسم المستخدم: $username
-          🔑 كلمة المرور: $password
-          
-          ⏱️  صلاحية النفق: 6 ساعات
-          💻 نظام التشغيل: Windows Server 2022
-          "@
-          
-          # ترميز الرسالة لإرسالها عبر HTTP POST
           $encodedMessage = [System.Net.WebUtility]::UrlEncode($message)
-          
-          # إرسال الرسالة إلى بوت تليجرام
-          $telegramApiUrl = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
+          $apiUrl = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
           $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$encodedMessage"
           
-          Invoke-RestMethod -Uri $telegramApiUrl -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
-          
-          # إخفاء كلمة السر واسم المستخدم من السجلات
-          Write-Host "::add-mask::$username"
-          Write-Host "::add-mask::$password"
-          Write-Host "✅ تم إرسال معلومات الاتصال إلى تليجرام"
+          $response = Invoke-RestMethod -Uri $apiUrl -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
+          if ($response.ok) {
+            Write-Host "✅ تم إرسال المعلومات إلى تليجرام"
+          } else {
+            Write-Error "فشل الإرسال إلى تليجرام: $($response.description)"
+            exit 1
+          }
 
-      - name: 5. الحفاظ على التشغيل
+      - name: 6. الحفاظ على التشغيل للمدة المطلوبة
         shell: pwsh
         run: |
-          $totalMinutes = ${{ github.event.inputs.duration_minutes }}
-          Write-Host "🟢 الخادم يعمل لمدة $totalMinutes دقيقة."
+          $totalMinutes = [int]${{ github.event.inputs.duration_minutes }}
+          if ($totalMinutes -gt 360) { $totalMinutes = 360 }
+          Write-Host "🟢 الخادم يعمل لمدة $totalMinutes دقيقة. سيتم إيقافه تلقائياً."
           Start-Sleep -Seconds ($totalMinutes * 60)
 
-      - name: 6. تنظيف المستخدم
+      - name: 7. تنظيف المستخدم وإغلاق النفق
         shell: pwsh
         if: always()
         run: |
           $username = "${{ secrets.RDP_USERNAME }}"
-          net user $username /delete
-          Write-Host "🧹 تم حذف المستخدم و إغلاق الجلسة."
+          if ($username) {
+            net user $username /delete 2>$null
+            Write-Host "🧹 تم حذف المستخدم $username"
+          }
+          # إيقاف عملية cloudflared إذا كانت لا تزال تعمل
+          Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Host "✅ تم تنظيف البيئة بالكامل"
