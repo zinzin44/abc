@@ -1,34 +1,102 @@
-name: RDP
-on: workflow_dispatch
+name: Windows-RDP-Secure-Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'مدة التشغيل بالدقائق (الحد الأقصى 360 دقيقة)'
+        required: false
+        default: '360'
+
 jobs:
-  build:
+  deploy:
     runs-on: windows-latest
+
     steps:
-      - run: curl -L --output cf.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
-      - shell: pwsh
+      - name: 1. تحميل Cloudflared
         run: |
-          $pass = "${{ secrets.RDP_PASSWORD }}"
-          net user User $pass /add
-          net localgroup administrators User /add
+          curl -L --output cloudflared.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
+
+      - name: 2. تكوين RDP
+        shell: pwsh
+        run: |
+          $securePassword = "${{ secrets.RDP_PASSWORD }}"
+          $username = "${{ secrets.RDP_USERNAME }}"
+          
+          # إخفاء كلمة السر واسم المستخدم من السجلات
+          Write-Host "::add-mask::$securePassword"
+          Write-Host "::add-mask::$username"
+          
+          # إنشاء المستخدم وإعداد RDP
+          net user $username $securePassword /add
+          net localgroup administrators $username /add
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Start-Service TermService
-      - shell: pwsh
-        run: Start-Process -FilePath ".\cf.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -NoNewWindow -RedirectStandardError err.txt
-      - shell: pwsh
+
+      - name: 3. إنشاء نفق Cloudflare
+        shell: pwsh
         run: |
-          Start-Sleep -Seconds 15
-          $content = Get-Content err.txt -Raw
-          $url = [regex]::Match($content, 'https://[a-z0-9-]+\.trycloudflare\.com').Value
-          "URL: $url" | Out-File info.txt
-          "User: User" | Out-File info.txt -Append
-          "Pass: ${{ secrets.RDP_PASSWORD }}" | Out-File info.txt -Append
-      - uses: actions/upload-artifact@v4
-        with:
-          name: info
-          path: info.txt
+          # تشغيل النفق في الخلفية وتسجيل المخرجات
+          Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -NoNewWindow -RedirectStandardOutput "out.txt" -RedirectStandardError "err.txt"
+
+          # انتظار الحصول على رابط النفق
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            $content = Get-Content "err.txt" -ErrorAction SilentlyContinue
+            if ($content -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
+              $tunnelUrl = $matches[0]
+              break
+            }
+          }
+          # حفظ الرابط في ملف
+          $tunnelUrl | Out-File -FilePath "tunnel_url.txt" -Encoding ascii
+
+      - name: 4. إرسال معلومات الاتصال إلى تليجرام
+        shell: pwsh
+        run: |
+          $tunnelUrl = Get-Content "tunnel_url.txt" -Raw
+          $username = "${{ secrets.RDP_USERNAME }}"
+          $password = "${{ secrets.RDP_PASSWORD }}"
+          
+          # تجميع الرسالة
+          $message = @"
+          ✅ تم تشغيل RDP بنجاح!
+          
+          🔗 رابط الاتصال: $tunnelUrl
+          👤 اسم المستخدم: $username
+          🔑 كلمة المرور: $password
+          
+          ⏱️  صلاحية النفق: 6 ساعات
+          💻 نظام التشغيل: Windows Server 2022
+          "@
+          
+          # ترميز الرسالة لإرسالها عبر HTTP POST
+          $encodedMessage = [System.Net.WebUtility]::UrlEncode($message)
+          
+          # إرسال الرسالة إلى بوت تليجرام
+          $telegramApiUrl = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
+          $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$encodedMessage"
+          
+          Invoke-RestMethod -Uri $telegramApiUrl -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
+          
+          # إخفاء كلمة السر واسم المستخدم من السجلات
+          Write-Host "::add-mask::$username"
+          Write-Host "::add-mask::$password"
+          Write-Host "✅ تم إرسال معلومات الاتصال إلى تليجرام"
+
+      - name: 5. الحفاظ على التشغيل
+        shell: pwsh
+        run: |
+          $totalMinutes = ${{ github.event.inputs.duration_minutes }}
+          Write-Host "🟢 الخادم يعمل لمدة $totalMinutes دقيقة."
+          Start-Sleep -Seconds ($totalMinutes * 60)
+
+      - name: 6. تنظيف المستخدم
+        shell: pwsh
         if: always()
-      - run: ping -n 21600 127.0.0.1 > nul
-      - shell: pwsh
-        if: always()
-        run: net user User /delete
+        run: |
+          $username = "${{ secrets.RDP_USERNAME }}"
+          net user $username /delete
+          Write-Host "🧹 تم حذف المستخدم و إغلاق الجلسة."
