@@ -1,5 +1,4 @@
-name: Windows-RDP-Secure-Telegram
-
+name: WindowsRDPSecureTelegram
 on:
   workflow_dispatch:
     inputs:
