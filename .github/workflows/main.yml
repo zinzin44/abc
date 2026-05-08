@@ -39,21 +39,38 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Start-Service TermService
 
-      - name: Start Tunnel
+      - name: Start Tunnel and Get URL
         shell: pwsh
         run: |
-          Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -NoNewWindow -RedirectStandardError err.txt
+          # تشغيل النفق مع توجيه كلا المخرجين
+          $proc = Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -NoNewWindow -PassThru -RedirectStandardError stderr.txt -RedirectStandardOutput stdout.txt
+          
+          # انتظار الرابط (الحد الأقصى 90 ثانية)
           $url = $null
-          for ($i = 0; $i -lt 30; $i++) {
+          for ($i = 0; $i -lt 45; $i++) {
             Start-Sleep -Seconds 2
-            $content = Get-Content err.txt -ErrorAction SilentlyContinue
+            # ابحث في stderr ثم stdout
+            $content = Get-Content stderr.txt -ErrorAction SilentlyContinue
+            if (-not $content) { $content = Get-Content stdout.txt -ErrorAction SilentlyContinue }
             if ($content -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
               $url = $matches[0]
+              Write-Host "Found URL: $url"
               break
             }
           }
-          if (-not $url) { Write-Error "No tunnel URL"; exit 1 }
+          
+          if (-not $url) {
+            Write-Host "ERROR: Could not find tunnel URL within timeout."
+            Write-Host "--- STDERR ---"
+            Get-Content stderr.txt -ErrorAction SilentlyContinue
+            Write-Host "--- STDOUT ---"
+            Get-Content stdout.txt -ErrorAction SilentlyContinue
+            exit 1
+          }
+          
           $url | Out-File -FilePath tunnel_url.txt -Encoding ascii
+          # حفظ PID لإنهاء العملية لاحقاً
+          $proc.Id | Out-File -FilePath tunnel.pid
 
       - name: Send to Telegram
         shell: pwsh
@@ -61,23 +78,29 @@ jobs:
           $url = Get-Content tunnel_url.txt -Raw
           $user = "${{ secrets.RDP_USERNAME }}"
           $pass = "${{ secrets.RDP_PASSWORD }}"
-          $msg = "RDP Ready`nURL: $url`nUser: $user`nPass: $pass`nDuration: ${{ github.event.inputs.duration_minutes }} min"
-          $enc = [System.Net.WebUtility]::UrlEncode($msg)
+          $duration = "${{ github.event.inputs.duration_minutes }}"
+          $msg = "RDP Ready%0AURL: $url%0AUser: $user%0APass: $pass%0ADuration: $duration min"
           $api = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
-          $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$enc"
-          Invoke-RestMethod -Uri $api -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
+          $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$msg"
+          Invoke-RestMethod -Uri $api -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" | Out-Null
+          Write-Host "Message sent to Telegram"
 
       - name: Keep Alive
         shell: pwsh
         run: |
           $minutes = [int]${{ github.event.inputs.duration_minutes }}
           if ($minutes -gt 360) { $minutes = 360 }
+          Write-Host "Keeping alive for $minutes minutes"
           Start-Sleep -Seconds ($minutes * 60)
 
       - name: Cleanup
         shell: pwsh
         if: always()
         run: |
+          if (Test-Path tunnel.pid) {
+            $pid = Get-Content tunnel.pid
+            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+          }
           $user = "${{ secrets.RDP_USERNAME }}"
           if ($user) { net user $user /delete 2>$null }
-          Get-Process -Name cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Host "Cleanup finished"
