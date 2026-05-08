@@ -40,12 +40,11 @@ jobs:
           Start-Sleep -Seconds 5
           $portOpen = (Get-NetTCPConnection -LocalPort 3389).Count -gt 0
           if (-not $portOpen) { Write-Error "Port 3389 not open"; exit 1 }
-          Write-Host "✅ RDP is ready"
+          Write-Host "RDP is ready"
 
       - name: Create Stable TCP Tunnel
         shell: pwsh
         run: |
-          # تشغيل النفق باستخدام HTTP/2 لمنع انقطاع اتصالات QUIC
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = ".\cloudflared.exe"
           $psi.Arguments = "tunnel --protocol http2 --url tcp://localhost:3389"
@@ -72,7 +71,7 @@ jobs:
           }
           $url | Out-File -FilePath tunnel_url.txt -Encoding ascii
           $proc.Id | Out-File -FilePath tunnel.pid
-          Write-Host "✅ Stable TCP tunnel created"
+          Write-Host "Stable TCP tunnel created"
 
       - name: Send Connection Instructions to Telegram
         shell: pwsh
@@ -82,38 +81,33 @@ jobs:
           $user = "${{ secrets.RDP_USERNAME }}"
           $pass = "${{ secrets.RDP_PASSWORD }}"
           $duration = "${{ github.event.inputs.duration_minutes }}"
-          $msg = @"
-✅ RDP Tunnel Ready (Stable Connection)
-
-🔗 Tunnel URL: $url
-
-📥 Instructions (Very Important):
-1. Download cloudflared from: https://github.com/cloudflare/cloudflared/releases
-2. Open a terminal in the folder where you downloaded cloudflared.exe
-3. Run this command (replace XXXX with the actual hostname from your URL):
-   cloudflared access tcp --hostname $hostname --url localhost:3333
-4. Keep this terminal window open and running.
-5. Open the Remote Desktop Connection app (Run: mstsc).
-6. Enter: localhost:3333 in the Computer field.
-7. Enter the following credentials:
-   Username: $user
-   Password: $pass
-8. Click Connect and accept any certificate warning.
-
-⏱️ Tunnel active for $duration minutes.
-"@
-          $encoded = [System.Net.WebUtility]::UrlEncode($msg)
+          # بناء الرسالة بدون heredoc
+          $msg = "✅ RDP Tunnel Ready (Stable Connection)%0A%0A"
+          $msg += "🔗 Tunnel URL: $url%0A%0A"
+          $msg += "📥 Instructions (Very Important):%0A"
+          $msg += "1. Download cloudflared from: https://github.com/cloudflare/cloudflared/releases%0A"
+          $msg += "2. Open a terminal in the folder where you downloaded cloudflared.exe%0A"
+          $msg += "3. Run this command:%0A"
+          $msg += "   cloudflared access tcp --hostname $hostname --url localhost:3333%0A"
+          $msg += "4. Keep this terminal window open and running.%0A"
+          $msg += "5. Open Remote Desktop Connection (Run: mstsc).%0A"
+          $msg += "6. Enter: localhost:3333 in the Computer field.%0A"
+          $msg += "7. Enter the following credentials:%0A"
+          $msg += "   Username: $user%0A"
+          $msg += "   Password: $pass%0A"
+          $msg += "8. Click Connect and accept any certificate warning.%0A%0A"
+          $msg += "⏱️ Tunnel active for $duration minutes."
           $api = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
-          $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$encoded"
+          $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$msg"
           Invoke-RestMethod -Uri $api -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" | Out-Null
-          Write-Host "✅ Instructions sent to Telegram"
+          Write-Host "Instructions sent to Telegram"
 
       - name: Keep Runner Alive
         shell: pwsh
         run: |
           $minutes = [int]${{ github.event.inputs.duration_minutes }}
           if ($minutes -gt 360) { $minutes = 360 }
-          Write-Host "🟢 Tunnel active for $minutes minutes"
+          Write-Host "Tunnel active for $minutes minutes"
           Start-Sleep -Seconds ($minutes * 60)
 
       - name: Cleanup
@@ -126,4 +120,4 @@ jobs:
           }
           $user = "${{ secrets.RDP_USERNAME }}"
           if ($user) { net user $user /delete 2>$null }
-          Write-Host "🧹 Cleanup completed"
+          Write-Host "Cleanup completed"
