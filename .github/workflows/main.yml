@@ -38,40 +38,72 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
           Start-Sleep -Seconds 5
-          $portOpen = (Get-NetTCPConnection -LocalPort 3389).Count -gt 0
-          if (-not $portOpen) { Write-Error "Port 3389 not open"; exit 1 }
-          Write-Host "RDP is ready"
-
-      - name: Create Stable TCP Tunnel
-        shell: pwsh
-        run: |
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = ".\cloudflared.exe"
-          $psi.Arguments = "tunnel --protocol http2 --url tcp://localhost:3389"
-          $psi.UseShellExecute = $false
-          $psi.RedirectStandardError = $true
-          $psi.RedirectStandardOutput = $true
-          $psi.CreateNoWindow = $true
-          $proc = [System.Diagnostics.Process]::Start($psi)
-          $url = $null
-          $timeout = 90
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          while ($sw.Elapsed.TotalSeconds -lt $timeout -and -not $proc.HasExited) {
-            Start-Sleep -Milliseconds 500
-            $line = $proc.StandardError.ReadLine()
-            if ($line -and $line -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
-              $url = $matches[1]
-              Write-Host "::add-mask::$url"
-              break
-            }
-          }
-          if (-not $url) {
-            Write-Error "Failed to obtain tunnel URL"
+          if (-not (Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue)) {
+            Write-Error "Port 3389 not listening"
             exit 1
           }
+          Write-Host "RDP is ready"
+
+      - name: Create TCP Tunnel (with retry)
+        shell: pwsh
+        run: |
+          $retries = 3
+          $url = $null
+          for ($try=1; $try -le $retries; $try++) {
+            Write-Host "Attempt $try to start tunnel..."
+            # إعادة ضبط الملفات
+            Remove-Item -Force tunnel_stderr.txt -ErrorAction SilentlyContinue
+            Remove-Item -Force tunnel_stdout.txt -ErrorAction SilentlyContinue
+            
+            # تشغيل العملية مع إعادة توجيه إلى ملفات
+            $proc = Start-Process -FilePath ".\cloudflared.exe" `
+              -ArgumentList "tunnel --protocol auto --url tcp://localhost:3389" `
+              -NoNewWindow -PassThru `
+              -RedirectStandardError tunnel_stderr.txt `
+              -RedirectStandardOutput tunnel_stdout.txt
+            
+            # الانتظار لمدة تصل إلى 90 ثانية للرابط
+            $timeout = 90
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($sw.Elapsed.TotalSeconds -lt $timeout -and -not $proc.HasExited) {
+              Start-Sleep -Milliseconds 1000
+              if (Test-Path tunnel_stderr.txt) {
+                $content = Get-Content tunnel_stderr.txt -Raw
+                if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+                  $url = $matches[1]
+                  break
+                }
+              }
+            }
+            # إذا لم نجد الرابط، نقتل العملية ونجرب مرة أخرى
+            if ($url) { break }
+            Write-Host "No URL found on attempt $try, killing process..."
+            $proc.Kill()
+            Start-Sleep -Seconds 5
+          }
+          
+          if (-not $url) {
+            Write-Host "ERROR: Could not obtain tunnel URL after $retries attempts."
+            Write-Host "--- STDERR content ---"
+            Get-Content tunnel_stderr.txt -ErrorAction SilentlyContinue
+            Write-Host "--- STDOUT content ---"
+            Get-Content tunnel_stdout.txt -ErrorAction SilentlyContinue
+            exit 1
+          }
+          
+          Write-Host "::add-mask::$url"
           $url | Out-File -FilePath tunnel_url.txt -Encoding ascii
+          # نحتاج للحفاظ على العملية حية، لذلك نعيد تشغيلها إذا كانت قد ماتت
+          if ($proc.HasExited) {
+            Write-Host "Process exited, restarting tunnel in background..."
+            $proc = Start-Process -FilePath ".\cloudflared.exe" `
+              -ArgumentList "tunnel --protocol auto --url tcp://localhost:3389" `
+              -NoNewWindow -PassThru `
+              -RedirectStandardError tunnel_stderr.txt `
+              -RedirectStandardOutput tunnel_stdout.txt
+          }
           $proc.Id | Out-File -FilePath tunnel.pid
-          Write-Host "Stable TCP tunnel created"
+          Write-Host "Stable TCP tunnel created, URL obtained."
 
       - name: Send Connection Instructions to Telegram
         shell: pwsh
@@ -81,21 +113,17 @@ jobs:
           $user = "${{ secrets.RDP_USERNAME }}"
           $pass = "${{ secrets.RDP_PASSWORD }}"
           $duration = "${{ github.event.inputs.duration_minutes }}"
-          # بناء الرسالة بدون heredoc
-          $msg = "✅ RDP Tunnel Ready (Stable Connection)%0A%0A"
+          $msg = "✅ RDP Tunnel Ready%0A%0A"
           $msg += "🔗 Tunnel URL: $url%0A%0A"
-          $msg += "📥 Instructions (Very Important):%0A"
+          $msg += "📥 Instructions:%0A"
           $msg += "1. Download cloudflared from: https://github.com/cloudflare/cloudflared/releases%0A"
-          $msg += "2. Open a terminal in the folder where you downloaded cloudflared.exe%0A"
-          $msg += "3. Run this command:%0A"
-          $msg += "   cloudflared access tcp --hostname $hostname --url localhost:3333%0A"
-          $msg += "4. Keep this terminal window open and running.%0A"
-          $msg += "5. Open Remote Desktop Connection (Run: mstsc).%0A"
-          $msg += "6. Enter: localhost:3333 in the Computer field.%0A"
-          $msg += "7. Enter the following credentials:%0A"
-          $msg += "   Username: $user%0A"
+          $msg += "2. Open terminal in that folder%0A"
+          $msg += "3. Run: cloudflared access tcp --hostname $hostname --url localhost:3333%0A"
+          $msg += "4. Keep terminal open%0A"
+          $msg += "5. Open Remote Desktop (mstsc) -> localhost:3333%0A"
+          $msg += "6. Username: $user%0A"
           $msg += "   Password: $pass%0A"
-          $msg += "8. Click Connect and accept any certificate warning.%0A%0A"
+          $msg += "7. Accept certificate warning%0A%0A"
           $msg += "⏱️ Tunnel active for $duration minutes."
           $api = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
           $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$msg"
