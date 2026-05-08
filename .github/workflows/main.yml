@@ -42,27 +42,28 @@ jobs:
             Write-Error "Port 3389 not listening"
             exit 1
           }
+          Write-Host "RDP is ready"
 
       - name: Start Tunnel and Capture URL (Reliable)
         shell: pwsh
         run: |
-          # تشغيل cloudflared في الخلفية مع توجيه كل المخرجات إلى ملف
-          $logFile = "cloudflared_output.log"
+          $logFile = "cloudflared.log"
           $urlFile = "tunnel_url.txt"
-          # تأكد من أن الملفات فارغة
           Remove-Item -Force $logFile, $urlFile -ErrorAction SilentlyContinue
-          
-          # استخدم cmd لتشغيل العملية في الخلفية (للبقاء حية)
-          $startInfo = "start /B cmd /c .\cloudflared.exe tunnel --protocol auto --url tcp://localhost:3389 > $logFile 2>&1"
-          Invoke-Expression $startInfo
-          
-          # انتظر حتى يُكتب الرابط في الملف
-          $timeout = 120  # ثانية
+
+          # تشغيل cloudflared في الخلفية وكتابة الإخراج إلى ملف
+          $proc = Start-Process -FilePath ".\cloudflared.exe" `
+            -ArgumentList "tunnel --protocol auto --url tcp://localhost:3389" `
+            -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $logFile -RedirectStandardError $logFile
+
+          # انتظار ظهور الرابط في الملف
           $found = $false
-          for ($i=0; $i -lt $timeout; $i++) {
+          $timeout = 120
+          for ($i = 0; $i -lt $timeout; $i++) {
             Start-Sleep -Seconds 1
             if (Test-Path $logFile) {
-              $content = Get-Content $logFile -Raw
+              $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
               if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
                 $url = $matches[1]
                 $found = $true
@@ -70,23 +71,19 @@ jobs:
               }
             }
           }
-          
+
           if (-not $found) {
-            Write-Host "ERROR: Could not find tunnel URL in output."
-            Write-Host "--- Output so far ---"
+            Write-Host "ERROR: No tunnel URL found in log."
+            Write-Host "--- Log content ---"
             Get-Content $logFile -ErrorAction SilentlyContinue
             exit 1
           }
-          
-          # إخفاء الرابط من السجل تماماً
+
+          # إخفاء الرابط وحفظه
           Write-Host "::add-mask::$url"
           $url | Out-File -FilePath $urlFile -Encoding ascii
-          
-          # الحصول على PID العملية (لإنهائها لاحقاً)
-          $pid = (Get-Process -Name cloudflared -ErrorAction SilentlyContinue).Id
-          if ($pid) { $pid | Out-File -FilePath tunnel.pid }
-          
-          Write-Host "Tunnel started successfully. URL captured and hidden."
+          $proc.Id | Out-File -FilePath tunnel.pid
+          Write-Host "Tunnel started successfully. URL hidden."
 
       - name: Send Connection Instructions to Telegram
         shell: pwsh
@@ -118,7 +115,7 @@ jobs:
         run: |
           $minutes = [int]${{ github.event.inputs.duration_minutes }}
           if ($minutes -gt 360) { $minutes = 360 }
-          Write-Host "Runner will stay alive for $minutes minutes"
+          Write-Host "Runner active for $minutes minutes"
           Start-Sleep -Seconds ($minutes * 60)
 
       - name: Cleanup
