@@ -42,68 +42,51 @@ jobs:
             Write-Error "Port 3389 not listening"
             exit 1
           }
-          Write-Host "RDP is ready"
 
-      - name: Create TCP Tunnel (with retry)
+      - name: Start Tunnel and Capture URL (Reliable)
         shell: pwsh
         run: |
-          $retries = 3
-          $url = $null
-          for ($try=1; $try -le $retries; $try++) {
-            Write-Host "Attempt $try to start tunnel..."
-            # إعادة ضبط الملفات
-            Remove-Item -Force tunnel_stderr.txt -ErrorAction SilentlyContinue
-            Remove-Item -Force tunnel_stdout.txt -ErrorAction SilentlyContinue
-            
-            # تشغيل العملية مع إعادة توجيه إلى ملفات
-            $proc = Start-Process -FilePath ".\cloudflared.exe" `
-              -ArgumentList "tunnel --protocol auto --url tcp://localhost:3389" `
-              -NoNewWindow -PassThru `
-              -RedirectStandardError tunnel_stderr.txt `
-              -RedirectStandardOutput tunnel_stdout.txt
-            
-            # الانتظار لمدة تصل إلى 90 ثانية للرابط
-            $timeout = 90
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($sw.Elapsed.TotalSeconds -lt $timeout -and -not $proc.HasExited) {
-              Start-Sleep -Milliseconds 1000
-              if (Test-Path tunnel_stderr.txt) {
-                $content = Get-Content tunnel_stderr.txt -Raw
-                if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
-                  $url = $matches[1]
-                  break
-                }
+          # تشغيل cloudflared في الخلفية مع توجيه كل المخرجات إلى ملف
+          $logFile = "cloudflared_output.log"
+          $urlFile = "tunnel_url.txt"
+          # تأكد من أن الملفات فارغة
+          Remove-Item -Force $logFile, $urlFile -ErrorAction SilentlyContinue
+          
+          # استخدم cmd لتشغيل العملية في الخلفية (للبقاء حية)
+          $startInfo = "start /B cmd /c .\cloudflared.exe tunnel --protocol auto --url tcp://localhost:3389 > $logFile 2>&1"
+          Invoke-Expression $startInfo
+          
+          # انتظر حتى يُكتب الرابط في الملف
+          $timeout = 120  # ثانية
+          $found = $false
+          for ($i=0; $i -lt $timeout; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-Path $logFile) {
+              $content = Get-Content $logFile -Raw
+              if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+                $url = $matches[1]
+                $found = $true
+                break
               }
             }
-            # إذا لم نجد الرابط، نقتل العملية ونجرب مرة أخرى
-            if ($url) { break }
-            Write-Host "No URL found on attempt $try, killing process..."
-            $proc.Kill()
-            Start-Sleep -Seconds 5
           }
           
-          if (-not $url) {
-            Write-Host "ERROR: Could not obtain tunnel URL after $retries attempts."
-            Write-Host "--- STDERR content ---"
-            Get-Content tunnel_stderr.txt -ErrorAction SilentlyContinue
-            Write-Host "--- STDOUT content ---"
-            Get-Content tunnel_stdout.txt -ErrorAction SilentlyContinue
+          if (-not $found) {
+            Write-Host "ERROR: Could not find tunnel URL in output."
+            Write-Host "--- Output so far ---"
+            Get-Content $logFile -ErrorAction SilentlyContinue
             exit 1
           }
           
+          # إخفاء الرابط من السجل تماماً
           Write-Host "::add-mask::$url"
-          $url | Out-File -FilePath tunnel_url.txt -Encoding ascii
-          # نحتاج للحفاظ على العملية حية، لذلك نعيد تشغيلها إذا كانت قد ماتت
-          if ($proc.HasExited) {
-            Write-Host "Process exited, restarting tunnel in background..."
-            $proc = Start-Process -FilePath ".\cloudflared.exe" `
-              -ArgumentList "tunnel --protocol auto --url tcp://localhost:3389" `
-              -NoNewWindow -PassThru `
-              -RedirectStandardError tunnel_stderr.txt `
-              -RedirectStandardOutput tunnel_stdout.txt
-          }
-          $proc.Id | Out-File -FilePath tunnel.pid
-          Write-Host "Stable TCP tunnel created, URL obtained."
+          $url | Out-File -FilePath $urlFile -Encoding ascii
+          
+          # الحصول على PID العملية (لإنهائها لاحقاً)
+          $pid = (Get-Process -Name cloudflared -ErrorAction SilentlyContinue).Id
+          if ($pid) { $pid | Out-File -FilePath tunnel.pid }
+          
+          Write-Host "Tunnel started successfully. URL captured and hidden."
 
       - name: Send Connection Instructions to Telegram
         shell: pwsh
@@ -135,7 +118,7 @@ jobs:
         run: |
           $minutes = [int]${{ github.event.inputs.duration_minutes }}
           if ($minutes -gt 360) { $minutes = 360 }
-          Write-Host "Tunnel active for $minutes minutes"
+          Write-Host "Runner will stay alive for $minutes minutes"
           Start-Sleep -Seconds ($minutes * 60)
 
       - name: Cleanup
@@ -146,6 +129,7 @@ jobs:
             $pid = Get-Content tunnel.pid
             Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
           }
+          Get-Process -Name cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
           $user = "${{ secrets.RDP_USERNAME }}"
           if ($user) { net user $user /delete 2>$null }
-          Write-Host "Cleanup completed"
+          Write-Host "Cleanup finished"
