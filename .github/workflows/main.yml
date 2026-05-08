@@ -44,26 +44,27 @@ jobs:
           }
           Write-Host "RDP is ready"
 
-      - name: Start Tunnel and Capture URL (Reliable)
+      - name: Start Tunnel and Capture URL (Fixed)
         shell: pwsh
         run: |
-          $logFile = "cloudflared.log"
+          $stderrLog = "cloudflared_stderr.log"
+          $stdoutLog = "cloudflared_stdout.log"
           $urlFile = "tunnel_url.txt"
-          Remove-Item -Force $logFile, $urlFile -ErrorAction SilentlyContinue
+          Remove-Item -Force $stderrLog, $stdoutLog, $urlFile -ErrorAction SilentlyContinue
 
-          # تشغيل cloudflared في الخلفية وكتابة الإخراج إلى ملف
+          # تشغيل العملية مع توجيه stderr إلى ملف و stdout إلى ملف آخر
           $proc = Start-Process -FilePath ".\cloudflared.exe" `
             -ArgumentList "tunnel --protocol auto --url tcp://localhost:3389" `
             -WindowStyle Hidden -PassThru `
-            -RedirectStandardOutput $logFile -RedirectStandardError $logFile
+            -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
 
-          # انتظار ظهور الرابط في الملف
+          # البحث عن الرابط في ملف stderr (يظهر هناك غالباً)
           $found = $false
           $timeout = 120
           for ($i = 0; $i -lt $timeout; $i++) {
             Start-Sleep -Seconds 1
-            if (Test-Path $logFile) {
-              $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+            if (Test-Path $stderrLog) {
+              $content = Get-Content $stderrLog -Raw -ErrorAction SilentlyContinue
               if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
                 $url = $matches[1]
                 $found = $true
@@ -73,9 +74,11 @@ jobs:
           }
 
           if (-not $found) {
-            Write-Host "ERROR: No tunnel URL found in log."
-            Write-Host "--- Log content ---"
-            Get-Content $logFile -ErrorAction SilentlyContinue
+            Write-Host "ERROR: Could not find tunnel URL."
+            Write-Host "--- STDERR content ---"
+            Get-Content $stderrLog -ErrorAction SilentlyContinue
+            Write-Host "--- STDOUT content ---"
+            Get-Content $stdoutLog -ErrorAction SilentlyContinue
             exit 1
           }
 
@@ -83,7 +86,7 @@ jobs:
           Write-Host "::add-mask::$url"
           $url | Out-File -FilePath $urlFile -Encoding ascii
           $proc.Id | Out-File -FilePath tunnel.pid
-          Write-Host "Tunnel started successfully. URL hidden."
+          Write-Host "Tunnel ready, URL captured and hidden."
 
       - name: Send Connection Instructions to Telegram
         shell: pwsh
