@@ -1,10 +1,10 @@
-name: Windows-RDP-Secure-Telegram
+name: Windows-RDP-Secure-Telegram-TCP
 
 on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'مدة التشغيل بالدقائق'
+        description: 'مدة التشغيل بالدقائق (360 max)'
         required: false
         default: '360'
 
@@ -31,40 +31,24 @@ jobs:
           $pass = "${{ secrets.RDP_PASSWORD }}"
           Write-Host "::add-mask::$user"
           Write-Host "::add-mask::$pass"
-          # Create user
           net user $user $pass /add
           net localgroup administrators $user /add
-          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          # Disable NLA
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
-          # Allow RDP in firewall
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # Restart service
           Restart-Service TermService -Force
           Start-Sleep -Seconds 5
-          # Verify listening port
-          $listening = netstat -an | Select-String ":3389.*LISTENING"
-          if (-not $listening) {
-              Write-Host "WARNING: Port 3389 not listening yet. Retrying..."
-              Restart-Service TermService -Force
-              Start-Sleep -Seconds 10
-          }
-          # Test local connectivity
-          $portOpen = Test-NetConnection -ComputerName localhost -Port 3389 -InformationLevel Quiet
-          Write-Host "RDP port open: $portOpen"
-          if (-not $portOpen) {
-              Write-Error "Port 3389 is not open. RDP setup failed."
-              exit 1
-          }
+          $portOpen = (Get-NetTCPConnection -LocalPort 3389).Count -gt 0
+          if (-not $portOpen) { Write-Error "Port 3389 not open"; exit 1 }
+          Write-Host "✅ RDP is ready"
 
-      - name: Start Cloudflare Tunnel
+      - name: Create Stable TCP Tunnel
         shell: pwsh
         run: |
-          # Start tunnel and capture URL
+          # تشغيل النفق باستخدام HTTP/2 لمنع انقطاع اتصالات QUIC
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = ".\cloudflared.exe"
-          $psi.Arguments = "tunnel --url rdp://localhost:3389"
+          $psi.Arguments = "tunnel --protocol http2 --url tcp://localhost:3389"
           $psi.UseShellExecute = $false
           $psi.RedirectStandardError = $true
           $psi.RedirectStandardOutput = $true
@@ -83,33 +67,53 @@ jobs:
             }
           }
           if (-not $url) {
-            Write-Error "Could not extract tunnel URL"
+            Write-Error "Failed to obtain tunnel URL"
             exit 1
           }
-          # Save url and pid
           $url | Out-File -FilePath tunnel_url.txt -Encoding ascii
           $proc.Id | Out-File -FilePath tunnel.pid
-          Write-Host "Tunnel started. URL stored."
+          Write-Host "✅ Stable TCP tunnel created"
 
-      - name: Send Connection Info to Telegram
+      - name: Send Connection Instructions to Telegram
         shell: pwsh
         run: |
           $url = Get-Content tunnel_url.txt -Raw
+          $hostname = $url -replace 'https://',''
           $user = "${{ secrets.RDP_USERNAME }}"
           $pass = "${{ secrets.RDP_PASSWORD }}"
           $duration = "${{ github.event.inputs.duration_minutes }}"
-          $msg = "RDP Ready%0A%0AURL: $url%0AUser: $user%0APass: $pass%0ADuration: $duration min%0A%0AUse Microsoft Remote Desktop and accept certificate warning."
+          $msg = @"
+✅ RDP Tunnel Ready (Stable Connection)
+
+🔗 Tunnel URL: $url
+
+📥 Instructions (Very Important):
+1. Download cloudflared from: https://github.com/cloudflare/cloudflared/releases
+2. Open a terminal in the folder where you downloaded cloudflared.exe
+3. Run this command (replace XXXX with the actual hostname from your URL):
+   cloudflared access tcp --hostname $hostname --url localhost:3333
+4. Keep this terminal window open and running.
+5. Open the Remote Desktop Connection app (Run: mstsc).
+6. Enter: localhost:3333 in the Computer field.
+7. Enter the following credentials:
+   Username: $user
+   Password: $pass
+8. Click Connect and accept any certificate warning.
+
+⏱️ Tunnel active for $duration minutes.
+"@
+          $encoded = [System.Net.WebUtility]::UrlEncode($msg)
           $api = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
-          $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$msg"
+          $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$encoded"
           Invoke-RestMethod -Uri $api -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" | Out-Null
-          Write-Host "Info sent to Telegram."
+          Write-Host "✅ Instructions sent to Telegram"
 
       - name: Keep Runner Alive
         shell: pwsh
         run: |
           $minutes = [int]${{ github.event.inputs.duration_minutes }}
           if ($minutes -gt 360) { $minutes = 360 }
-          Write-Host "Maintaining tunnel for $minutes minutes..."
+          Write-Host "🟢 Tunnel active for $minutes minutes"
           Start-Sleep -Seconds ($minutes * 60)
 
       - name: Cleanup
@@ -122,4 +126,4 @@ jobs:
           }
           $user = "${{ secrets.RDP_USERNAME }}"
           if ($user) { net user $user /delete 2>$null }
-          Write-Host "Cleanup completed."
+          Write-Host "🧹 Cleanup completed"
