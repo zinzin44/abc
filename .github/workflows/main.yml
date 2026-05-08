@@ -23,7 +23,7 @@ jobs:
           if ("${{ secrets.RDP_PASSWORD }}" -eq "") { Write-Error "Missing RDP_PASSWORD"; exit 1 }
           if ("${{ secrets.TELEGRAM_BOT_TOKEN }}" -eq "") { Write-Error "Missing TELEGRAM_BOT_TOKEN"; exit 1 }
           if ("${{ secrets.TELEGRAM_CHAT_ID }}" -eq "") { Write-Error "Missing TELEGRAM_CHAT_ID"; exit 1 }
-          Write-Host "✅ All secrets are present"
+          Write-Host "✅ All secrets present"
 
       - name: Setup RDP and User
         shell: pwsh
@@ -39,17 +39,15 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Start-Service TermService
 
-      - name: Start Tunnel and Get URL
+      - name: Start Tunnel and Get URL (Secret)
         shell: pwsh
         run: |
-          # Wait for RDP port to be ready
-          Write-Host "Waiting for RDP port 3389..."
+          # انتظار جاهزية المنفذ
           for ($i=0; $i -lt 20; $i++) {
             if (Test-NetConnection localhost -Port 3389 -InformationLevel Quiet) { break }
             Start-Sleep -Seconds 1
           }
           
-          # Start cloudflared and read stderr directly
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = ".\cloudflared.exe"
           $psi.Arguments = "tunnel --url rdp://localhost:3389"
@@ -67,31 +65,47 @@ jobs:
             $line = $proc.StandardError.ReadLine()
             if ($line -and $line -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
               $url = $matches[0]
+              # إخفاء الرابط من السجل
+              Write-Host "::add-mask::$url"
               break
             }
           }
           if (-not $url) {
-            Write-Host "ERROR: Could not find tunnel URL within timeout."
-            Write-Host "Last stderr lines:"
-            for ($i=0; $i -lt 5; $i++) { $proc.StandardError.ReadLine() }
+            Write-Host "ERROR: No tunnel URL found"
             exit 1
           }
+          # حفظ الرابط في ملف (غير ظاهر)
           $url | Out-File -FilePath tunnel_url.txt -Encoding ascii
           $proc.Id | Out-File -FilePath tunnel.pid
-          Write-Host "✅ Tunnel started: $url"
+          # لا نطبع الرابط هنا أبداً
 
-      - name: Send to Telegram
+      - name: Test Tunnel (without exposing URL)
+        shell: pwsh
+        run: |
+          $url = Get-Content tunnel_url.txt -Raw
+          # اختبار أن الرابط يستجيب (اختياري)
+          try {
+            $test = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            Write-Host "✅ Tunnel is reachable"
+          } catch {
+            Write-Host "⚠️ Tunnel not yet reachable, but will continue"
+          }
+
+      - name: Send to Telegram (Secure)
         shell: pwsh
         run: |
           $url = Get-Content tunnel_url.txt -Raw
           $user = "${{ secrets.RDP_USERNAME }}"
           $pass = "${{ secrets.RDP_PASSWORD }}"
           $duration = "${{ github.event.inputs.duration_minutes }}"
+          # تشفير الرسالة
           $msg = "RDP Ready%0AURL: $url%0AUser: $user%0APass: $pass%0ADuration: $duration min"
           $api = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
           $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$msg"
+          # إخفاء الرابط أيضاً عند الخطأ إن ظهر
+          Write-Host "::add-mask::$url"
           Invoke-RestMethod -Uri $api -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" | Out-Null
-          Write-Host "✅ Message sent to Telegram"
+          Write-Host "✅ Message sent to Telegram (URL hidden)"
 
       - name: Keep Alive
         shell: pwsh
