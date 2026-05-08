@@ -23,7 +23,7 @@ jobs:
           if ("${{ secrets.RDP_PASSWORD }}" -eq "") { Write-Error "Missing RDP_PASSWORD"; exit 1 }
           if ("${{ secrets.TELEGRAM_BOT_TOKEN }}" -eq "") { Write-Error "Missing TELEGRAM_BOT_TOKEN"; exit 1 }
           if ("${{ secrets.TELEGRAM_CHAT_ID }}" -eq "") { Write-Error "Missing TELEGRAM_CHAT_ID"; exit 1 }
-          Write-Host "All secrets are present"
+          Write-Host "✅ All secrets are present"
 
       - name: Setup RDP and User
         shell: pwsh
@@ -42,35 +42,43 @@ jobs:
       - name: Start Tunnel and Get URL
         shell: pwsh
         run: |
-          # تشغيل النفق مع توجيه كلا المخرجين
-          $proc = Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -NoNewWindow -PassThru -RedirectStandardError stderr.txt -RedirectStandardOutput stdout.txt
+          # Wait for RDP port to be ready
+          Write-Host "Waiting for RDP port 3389..."
+          for ($i=0; $i -lt 20; $i++) {
+            if (Test-NetConnection localhost -Port 3389 -InformationLevel Quiet) { break }
+            Start-Sleep -Seconds 1
+          }
           
-          # انتظار الرابط (الحد الأقصى 90 ثانية)
+          # Start cloudflared and read stderr directly
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = ".\cloudflared.exe"
+          $psi.Arguments = "tunnel --url rdp://localhost:3389"
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardError = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.CreateNoWindow = $true
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          
           $url = $null
-          for ($i = 0; $i -lt 45; $i++) {
-            Start-Sleep -Seconds 2
-            # ابحث في stderr ثم stdout
-            $content = Get-Content stderr.txt -ErrorAction SilentlyContinue
-            if (-not $content) { $content = Get-Content stdout.txt -ErrorAction SilentlyContinue }
-            if ($content -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
+          $timeout = 90
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          while ($sw.Elapsed.TotalSeconds -lt $timeout -and -not $proc.HasExited) {
+            Start-Sleep -Milliseconds 500
+            $line = $proc.StandardError.ReadLine()
+            if ($line -and $line -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
               $url = $matches[0]
-              Write-Host "Found URL: $url"
               break
             }
           }
-          
           if (-not $url) {
             Write-Host "ERROR: Could not find tunnel URL within timeout."
-            Write-Host "--- STDERR ---"
-            Get-Content stderr.txt -ErrorAction SilentlyContinue
-            Write-Host "--- STDOUT ---"
-            Get-Content stdout.txt -ErrorAction SilentlyContinue
+            Write-Host "Last stderr lines:"
+            for ($i=0; $i -lt 5; $i++) { $proc.StandardError.ReadLine() }
             exit 1
           }
-          
           $url | Out-File -FilePath tunnel_url.txt -Encoding ascii
-          # حفظ PID لإنهاء العملية لاحقاً
           $proc.Id | Out-File -FilePath tunnel.pid
+          Write-Host "✅ Tunnel started: $url"
 
       - name: Send to Telegram
         shell: pwsh
@@ -83,14 +91,14 @@ jobs:
           $api = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
           $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$msg"
           Invoke-RestMethod -Uri $api -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" | Out-Null
-          Write-Host "Message sent to Telegram"
+          Write-Host "✅ Message sent to Telegram"
 
       - name: Keep Alive
         shell: pwsh
         run: |
           $minutes = [int]${{ github.event.inputs.duration_minutes }}
           if ($minutes -gt 360) { $minutes = 360 }
-          Write-Host "Keeping alive for $minutes minutes"
+          Write-Host "🟢 Keeping alive for $minutes minutes"
           Start-Sleep -Seconds ($minutes * 60)
 
       - name: Cleanup
@@ -103,4 +111,4 @@ jobs:
           }
           $user = "${{ secrets.RDP_USERNAME }}"
           if ($user) { net user $user /delete 2>$null }
-          Write-Host "Cleanup finished"
+          Write-Host "🧹 Cleanup finished"
