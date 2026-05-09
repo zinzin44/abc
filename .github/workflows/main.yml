@@ -32,14 +32,13 @@ jobs:
           Write-Host "::add-mask::$user"
           Write-Host "::add-mask::$pass"
           
-          # إنشاء المستخدم (مع التحقق من عدم وجوده مسبقاً)
           $existing = net user $user 2>$null
           if ($LASTEXITCODE -ne 0) {
             net user $user $pass /add
             net localgroup administrators $user /add
             Write-Host "User created successfully."
           } else {
-            Write-Host "User already exists, setting password..."
+            Write-Host "User already exists, updating password..."
             net user $user $pass
           }
           
@@ -49,7 +48,6 @@ jobs:
           Restart-Service TermService -Force
           Start-Sleep -Seconds 10
           
-          Write-Host "RDP Enabled. Checking port..."
           if (Test-NetConnection localhost -Port 3389 -InformationLevel Quiet) {
             Write-Host "Port 3389 is listening."
           } else {
@@ -59,34 +57,41 @@ jobs:
       - name: Start Tunnel (RDP mode)
         shell: pwsh
         run: |
-          $stderrLog = "stderr.log"
+          $stderrLog = "tunnel.log"
           $urlFile = "tunnel_url.txt"
           Remove-Item -Force $stderrLog, $urlFile -ErrorAction SilentlyContinue
-
-          # تشغيل النفق في الخلفية (RDP mode هو السر!)
+          
+          # ✅ تشغيل النفق في الخلفية - Arguments كـ Array
           $proc = Start-Process -FilePath ".\cloudflared.exe" `
-            -ArgumentList "tunnel --url rdp://localhost:3389" `
+            -ArgumentList @("tunnel", "--url", "rdp://localhost:3389") `
             -WindowStyle Hidden -PassThru `
             -RedirectStandardError $stderrLog
-
+          
+          $proc.Id | Out-File tunnel.pid
+          Write-Host "Tunnel PID: $($proc.Id)"
+          
           # انتظار الرابط
           $url = $null
           for ($i=0; $i -lt 120; $i++) {
             Start-Sleep -Seconds 1
-            $content = Get-Content $stderrLog -Raw -ErrorAction SilentlyContinue
-            if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
-              $url = $matches[1]
-              break
+            if (Test-Path $stderrLog) {
+              $content = Get-Content $stderrLog -Raw -ErrorAction SilentlyContinue
+              if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+                $url = $matches[1]
+                break
+              }
             }
           }
+          
           if (-not $url) {
-            Write-Host "Failed to get tunnel URL"
-            Get-Content $stderrLog
+            Write-Host "Failed to get tunnel URL. Full log:"
+            Get-Content $stderrLog -ErrorAction SilentlyContinue
             exit 1
           }
+          
           Write-Host "::add-mask::$url"
+          Write-Host "Tunnel URL: $url"
           $url | Out-File $urlFile
-          $proc.Id | Out-File tunnel.pid
 
       - name: Send to Telegram
         shell: pwsh
@@ -96,6 +101,7 @@ jobs:
           $user = "${{ secrets.RDP_USERNAME }}"
           $pass = "${{ secrets.RDP_PASSWORD }}"
           $duration = "${{ github.event.inputs.duration_minutes }}"
+          
           $msg = "✅ RDP Tunnel Ready%0A%0A"
           $msg += "🔗 Tunnel URL: $url%0A%0A"
           $msg += "📥 How to connect:%0A"
@@ -110,6 +116,7 @@ jobs:
           $msg += "   Password: $pass%0A"
           $msg += "7. Accept certificate warning%0A%0A"
           $msg += "⏱️ Tunnel active for $duration minutes."
+          
           $api = "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
           $body = "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=$msg"
           Invoke-RestMethod -Uri $api -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" | Out-Null
@@ -126,7 +133,9 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          if (Test-Path tunnel.pid) { Stop-Process -Id (Get-Content tunnel.pid) -Force -ErrorAction SilentlyContinue }
+          if (Test-Path tunnel.pid) { 
+            Stop-Process -Id (Get-Content tunnel.pid) -Force -ErrorAction SilentlyContinue 
+          }
           Get-Process -Name cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
           $user = "${{ secrets.RDP_USERNAME }}"
           if ($user) { net user $user /delete 2>$null }
