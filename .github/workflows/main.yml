@@ -89,8 +89,9 @@ jobs:
             exit 1
           }
           
+          # ✅ إخفاء الرابط في logs
           Write-Host "::add-mask::$url"
-          Write-Host "URL: $url"
+          Write-Host "URL obtained successfully"
           $url | Out-File $urlFile
           
           # إرسال إلى Telegram
@@ -148,7 +149,9 @@ jobs:
               }
               
               if ($url) {
-                Write-Host "🔄 New URL: $url"
+                # ✅ إخفاء الرابط الجديد في logs
+                Write-Host "::add-mask::$url"
+                Write-Host "🔄 New URL obtained"
                 $url | Out-File $urlFile
                 
                 # إرسال تحديث إلى Telegram
