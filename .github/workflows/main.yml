@@ -31,13 +31,24 @@ jobs:
           $pass = "${{ secrets.RDP_PASSWORD }}"
           Write-Host "::add-mask::$user"
           Write-Host "::add-mask::$pass"
-          net user $name $pass /add
-          net localgroup administrators $user /add
+          
+          # إنشاء المستخدم (مع التحقق من عدم وجوده مسبقاً)
+          $existing = net user $user 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            net user $user $pass /add
+            net localgroup administrators $user /add
+            Write-Host "User created successfully."
+          } else {
+            Write-Host "User already exists, setting password..."
+            net user $user $pass
+          }
+          
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
           Start-Sleep -Seconds 10
+          
           Write-Host "RDP Enabled. Checking port..."
           if (Test-NetConnection localhost -Port 3389 -InformationLevel Quiet) {
             Write-Host "Port 3389 is listening."
