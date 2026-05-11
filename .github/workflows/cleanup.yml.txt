@@ -1,0 +1,31 @@
+name: Delete Old Runs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  delete-runs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete all old runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO="${{ github.repository }}"
+
+          gh api \
+            /repos/$REPO/actions/runs \
+            --paginate \
+            --jq '.workflow_runs[].id' | while read id; do
+
+            echo "Deleting run $id"
+
+            gh api \
+              --method DELETE \
+              /repos/$REPO/actions/runs/$id || true
+
+          done
